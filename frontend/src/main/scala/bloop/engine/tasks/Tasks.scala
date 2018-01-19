@@ -45,13 +45,14 @@ object Tasks {
       val instance = project.scalaInstance
       val sourceDirs = project.sourceDirectories
       val classpath = project.classpath
+      val classpathOptions = project.classpathOptions
       val classesDir = project.classesDir
       val target = project.tmp
       val scalacOptions = project.scalacOptions
       val javacOptions = project.javacOptions
       val reporter = new Reporter(logger, project.baseDirectory.syntax, identity, config)
       // FORMAT: OFF
-      CompileInputs(instance, compilerCache, sourceDirs, classpath, classesDir, target, scalacOptions, javacOptions, result, reporter, logger)
+      CompileInputs(instance, classpathOptions, compilerCache, sourceDirs, classpath, classesDir, target, scalacOptions, javacOptions, result, reporter, logger)
       // FORMAT: ON
     }
 
@@ -134,10 +135,14 @@ object Tasks {
   def console(state: State, project: Project, config: ReporterConfig, noRoot: Boolean): State = {
     def runConsole(state: State, project: Project, classpath: Array[AbsolutePath]): Unit = {
       val scalaInstance = project.scalaInstance
+      val classpathOptions = project.classpathOptions
       val classpathFiles = classpath.map(_.underlying.toFile).toSeq
       state.logger.debug(s"Setting up the console classpath with ${classpathFiles.mkString(", ")}")
       val loader = ClasspathUtilities.makeLoader(classpathFiles, scalaInstance)
-      val compiler = state.compilerCache.get(scalaInstance).scalac.asInstanceOf[AnalyzingCompiler]
+      val compiler = state.compilerCache
+        .get((scalaInstance, classpathOptions))
+        .scalac
+        .asInstanceOf[AnalyzingCompiler]
       val ctxLoader = Thread.currentThread().getContextClassLoader()
       compiler.console(classpathFiles, project.scalacOptions, "", "", state.logger)(Some(loader))
     }
