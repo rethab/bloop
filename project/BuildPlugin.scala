@@ -2,7 +2,7 @@ package build
 
 import java.io.File
 
-import sbt.{AutoPlugin, Command, Def, Keys, PluginTrigger, Plugins, ThisBuild}
+import sbt.{AutoPlugin, Command, Def, Keys, PluginTrigger, Plugins, Task, ThisBuild}
 import sbt.io.{AllPassFilter, IO}
 import sbt.io.syntax.fileToRichFile
 import sbt.librarymanagement.syntax.stringToOrganization
@@ -88,7 +88,9 @@ object BuildKeys {
 
   import ohnosequences.sbt.GithubRelease.{keys => GHReleaseKeys}
   val releaseSettings = Seq(
-    GHReleaseKeys.ghreleaseNotes := { tagName => IO.read(buildBase.value / "notes" / s"$tagName.md") },
+    GHReleaseKeys.ghreleaseNotes := { tagName =>
+      IO.read(buildBase.value / "notes" / s"$tagName.md")
+    },
     GHReleaseKeys.ghreleaseRepoOrg := "scalacenter",
     GHReleaseKeys.ghreleaseRepoName := "bloop",
     GHReleaseKeys.ghreleaseAssets += ReleaseUtils.versionedInstallScript.value,
@@ -147,6 +149,9 @@ object BuildKeys {
 object BuildImplementation {
   import sbt.{url, file}
   import sbt.{Developer, Resolver, Watched, Compile, Test}
+  import sbtdynver.GitDescribeOutput
+  import sbtdynver.DynVerPlugin.{autoImport => DynVerKeys}
+  import bintray.BintrayKeys
 
   // This should be added to upstream sbt.
   def GitHub(org: String, project: String): java.net.URL =
@@ -162,25 +167,45 @@ object BuildImplementation {
     Keys.autoAPIMappings := true,
     Keys.publishMavenStyle := true,
     Keys.homepage := Some(ThisRepo),
-    Keys.licenses := Seq("BSD" -> url("http://opensource.org/licenses/BSD-3-Clause")),
+    Keys.licenses := Seq("Apache-2.0" -> url("http://www.apache.org/licenses/LICENSE-2.0")),
     Keys.developers := List(
       GitHubDev("Duhemm", "Martin Duhem", "martin.duhem@gmail.com"),
       GitHubDev("jvican", "Jorge Vicente Cantero", "jorge@vican.me")
     ),
-    ReleaseEarlyKeys.releaseEarlyWith := ReleaseEarlyKeys.SonatypePublisher,
+  ) ++ sharedBuildPublishSettings
+
+  final lazy val sharedBuildPublishSettings: Seq[Def.Setting[_]] = Seq(
+    ReleaseEarlyKeys.releaseEarlyWith := ReleaseEarlyKeys.BintrayPublisher,
+    BintrayKeys.bintrayOrganization := Some("scalacenter"),
   )
 
+  final lazy val sharedProjectPublishSettings: Seq[Def.Setting[_]] = Seq(
+    BintrayKeys.bintrayRepository := "releases",
+    BintrayKeys.bintrayPackage := {
+      val ref = Keys.thisProjectRef.value
+      if (ref.build == BuildKeys.ZincProject.build) "zinc"
+      else if (ref.build == BuildKeys.NailgunProject.build) "nailgun"
+      else if (ref.build == BuildKeys.BspProject.build) "bsp"
+      else "bloop" // As a fallback, we release to bloop.
+    }
+  )
+
+  import ch.epfl.scala.sbt.release.ReleaseEarly
   final val globalSettings: Seq[Def.Setting[_]] = Seq(
     Keys.testOptions in Test += sbt.Tests.Argument("-oD"),
     Keys.onLoadMessage := Header.intro,
     Keys.commands ~= BuildDefaults.fixPluginCross _,
     Keys.onLoad := BuildDefaults.onLoad.value,
-    Keys.publishArtifact in Test := false
+    Keys.publishArtifact in Test := false,
+    // Add resolver so that we can lazy publish modules that are only in bintray
+    Keys.resolvers := {
+      val previous = Keys.resolvers.value
+      (previous :+ Resolver.bintrayRepo("scalacenter", "releases")).distinct
+    },
   )
 
   final val buildSettings: Seq[Def.Setting[_]] = Seq(
     Keys.organization := "ch.epfl.scala",
-    Keys.resolvers += Resolver.jcenterRepo,
     Keys.updateOptions := Keys.updateOptions.value.withCachedResolution(true),
     Keys.scalaVersion := "2.12.4",
     Keys.triggeredMessage := Watched.clearWhenTriggered,
@@ -195,11 +220,34 @@ object BuildImplementation {
     },
     Keys.libraryDependencies ++= {
       if (Keys.scalaBinaryVersion.value.startsWith("2.10")) Nil
-      else List(
-        compilerPlugin("org.scalameta" % "semanticdb-scalac" % "2.1.5" cross CrossVersion.full)
+      else
+        List(
+          compilerPlugin("org.scalameta" % "semanticdb-scalac" % "2.1.5" cross CrossVersion.full)
+        )
+    },
+    // Legal requirement: license and notice files must be in the published jar
+    Keys.resources in Compile ++= BuildDefaults.getLicense.value,
+    Keys.publishArtifact in Test := false,
+    Keys.publishArtifact in (Compile, Keys.packageDoc) := {
+      val output = DynVerKeys.dynverGitDescribeOutput.value
+      val version = Keys.version.value
+      BuildDefaults.publishDocAndSourceArtifact(output, version)
+    },
+    Keys.publishArtifact in (Compile, Keys.packageSrc) := {
+      val output = DynVerKeys.dynverGitDescribeOutput.value
+      val version = Keys.version.value
+      BuildDefaults.publishDocAndSourceArtifact(output, version)
+    },
+    // Add some metadata that is useful to see in every bintray release
+    BintrayKeys.bintrayPackageLabels := List("productivity", "build", "server", "cli", "tooling"),
+    BintrayKeys.bintrayVersionAttributes ++= {
+      import bintry.Attr
+      Map(
+        "zinc" -> Seq(Attr.String(Keys.version.in(BuildKeys.ZincBridge).value)),
+        "nailgun" -> Seq(Attr.String(Keys.version.in(BuildKeys.NailgunServer).value))
       )
     }
-  )
+  ) ++ sharedProjectPublishSettings
 
   final val reasonableCompileOptions = (
     "-deprecation" :: "-encoding" :: "UTF-8" :: "-feature" :: "-language:existentials" ::
@@ -213,32 +261,41 @@ object BuildImplementation {
     import sbt.State
     /* This rounds off the trickery to set up those projects whose `overridingProjectSettings` have
      * been overriden because sbt has decided to initialize the settings from the sourcedep after. */
-    val hijacked = sbt.AttributeKey[Boolean]("TheHijackedOptionOfBloop.")
+    val hijacked = sbt.AttributeKey[Boolean]("theHijackedOptionOfBloop.")
     val onLoad: Def.Initialize[State => State] = Def.setting { (state: State) =>
       val globalSettings =
         List(Keys.onLoadMessage in sbt.Global := s"Setting up the integration builds.")
       def genProjectSettings(ref: sbt.ProjectRef) =
-        BuildKeys.inProject(ref)(List(
-          Keys.organization := "ch.epfl.scala",
-          Keys.homepage := {
-            val previousHomepage = Keys.homepage.value
-            if (previousHomepage.nonEmpty) previousHomepage
-            else (Keys.homepage in ThisBuild).value
-          },
-          Keys.developers := {
-            val previousDevelopers = Keys.developers.value
-            if (previousDevelopers.nonEmpty) previousDevelopers
-            else (Keys.developers in ThisBuild).value
-          },
-          Keys.licenses := {
-            val previousLicenses = Keys.licenses.value
-            if (previousLicenses.nonEmpty) previousLicenses
-            else (Keys.licenses in ThisBuild).value
-          },
-          ReleaseEarlyKeys.releaseEarlyIgnoreLocalRepository := false,
-          ReleaseEarlyKeys.releaseEarlyWith :=
-            ReleaseEarlyKeys.releaseEarlyWith.in(ThisBuild).value,
-        ))
+        BuildKeys.inProject(ref)(
+          List(
+            Keys.organization := "ch.epfl.scala",
+            Keys.homepage := {
+              val previousHomepage = Keys.homepage.value
+              if (previousHomepage.nonEmpty) previousHomepage
+              else (Keys.homepage in ThisBuild).value
+            },
+            Keys.developers := {
+              val previousDevelopers = Keys.developers.value
+              if (previousDevelopers.nonEmpty) previousDevelopers
+              else (Keys.developers in ThisBuild).value
+            },
+            Keys.licenses := {
+              val previousLicenses = Keys.licenses.value
+              if (previousLicenses.nonEmpty) previousLicenses
+              else (Keys.licenses in ThisBuild).value
+            },
+            Keys.publishArtifact in Test := false,
+            Keys.publishArtifact in (Compile, Keys.packageDoc) := {
+              val output = DynVerKeys.dynverGitDescribeOutput.in(ref).in(ThisBuild).value
+              val version = Keys.version.in(ref).value
+              BuildDefaults.publishDocAndSourceArtifact(output, version)
+            },
+            Keys.publishArtifact in (Compile, Keys.packageSrc) := {
+              val output = DynVerKeys.dynverGitDescribeOutput.in(ref).in(ThisBuild).value
+              val version = Keys.version.in(ref).value
+              BuildDefaults.publishDocAndSourceArtifact(output, version)
+            }
+          ) ++ sharedBuildPublishSettings ++ sharedProjectPublishSettings)
       val buildStructure = sbt.Project.structure(state)
       if (state.get(hijacked).getOrElse(false)) state.remove(hijacked)
       else {
@@ -347,6 +404,33 @@ object BuildImplementation {
         }
       },
     )
+
+    // From sbt-sensible https://gitlab.com/fommil/sbt-sensible/issues/5, legal requirement
+    val getLicense: Def.Initialize[Task[Seq[File]]] = Def.task {
+      val orig = (Keys.resources in Compile).value
+      val base = Keys.baseDirectory.value
+      val root = (Keys.baseDirectory in ThisBuild).value
+
+      def fileWithFallback(name: String): File =
+        if ((base / name).exists) base / name
+        else if ((root / name).exists) root / name
+        else throw new IllegalArgumentException(s"legal file $name must exist")
+
+      Seq(fileWithFallback("LICENSE.md"), fileWithFallback("NOTICE.md"))
+    }
+
+    /**
+     * This setting figures out whether the version is a snapshot or not and configures
+     * the source and doc artifacts that are published by the build.
+     *
+     * Snapshot is a term with no clear definition. In this code, a snapshot is a revision
+     * that is dirty, e.g. has time metadata in its representation. In those cases, the
+     * build will not publish doc and source artifacts by any of the publishing actions.
+     */
+    def publishDocAndSourceArtifact(info: Option[GitDescribeOutput], version: String): Boolean = {
+      val isStable = info.map(_.dirtySuffix.value.isEmpty)
+      !isStable.map(stable => !stable || version.endsWith("-SNAPSHOT")).getOrElse(false)
+    }
   }
 }
 
