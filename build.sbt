@@ -152,12 +152,11 @@ val mavenBloop = project
 
 val docs = project
   .in(file("website"))
-  .enablePlugins(HugoPlugin)
+  .enablePlugins(HugoPlugin, GhpagesPlugin)
   .settings(
     name := "bloop-website",
     skip in publish := true,
-    sourceDirectory in Hugo := baseDirectory.value
-    // baseURL in Hugo := uri("https://scala.epfl.ch"),
+    websiteSettings
   )
 
 val allProjects = Seq(backend, benchmarks, frontend, integrationsCore, sbtBloop, mavenBloop)
@@ -185,6 +184,8 @@ addCommandAlias(
   ).mkString(";", ";", "")
 )
 
+// Runs the scripted tests to setup integration tests
+// ! This is used by the benchmarks too !
 addCommandAlias(
   "runTests",
   List(
@@ -193,6 +194,8 @@ addCommandAlias(
   ).mkString(";", ";", "")
 )
 
+// Publishes locally all the components of Bloop
+// ! This is used by the benchmars too !
 addCommandAlias(
   "install",
   Seq(
